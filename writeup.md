@@ -114,12 +114,12 @@ Two notes matter more than the code.
 | Cause | Adapter behaviour |
 |---|---|
 | Dispatch reverts | Caller's tx reverts with `AggregatorCallFailed`; the whole transaction unwinds, so the reservation never commits and the slot stays free |
-| Dispatch returns a zero id | Same, reason `aggregator_zero_id` — treated as failure, not stored as a valid round |
+| Dispatch returns a zero id | Same unwind: the transaction reverts and no round is stored |
 | Round still running | `settle` reverts with `NotSettleable`; **no placeholder score is latched** |
-| Round ran and failed | `settle` emits `aggregator_failed` then reverts; `resolveFailure(_, false)` is the terminal path |
+| Round ran and failed | `settle` reverts with `NotSettleable` and latches nothing; `resolveFailure(_, false)` is the terminal path |
 | Deadline passed, result already available | `settle` — a timeout never overwrites a usable score |
 | Round opened for a request naming another validator | `openRound` refuses before spending ETH |
-| Registry response reverts | Status restored to the state its entrypoint accepts, then revert, so the call can be retried |
+| Registry response reverts | The whole transaction unwinds to the entry status, so the call can be retried |
 
 The last row is the subtle one. A revert in the registry call rolls back the **entire** transaction, including the status write that preceded it — there is no partial commit. The job returns to its entry status (`Requested` or `Fulfilled`), which is by construction the status the corresponding entrypoint accepts, so the call can be retried. `TimedOut` and `Failed` are internal marks within one transaction: `resolveFailure` writes them and reaches `Responded` in the same call, or the whole transaction reverts, so no external reader observes them.
 
@@ -136,7 +136,7 @@ The reference takes the maximum element and saturates at 100. **Which element me
 ### Access control and safety
 
 - `SimpleOwnable` plus a `relayers` mapping. Admin (`setRelayer`, `setAggregator`, `setPolicy`, `withdrawEth`, `transferOwnership`) is `onlyOwner`; job progression is `onlyOwnerOrRelayer`, so the operational key can be hot and the policy key cold.
-- `nonReentrant` on both ETH-out paths (`claimAggregatorCredit`, `withdrawEth`). `openRound` reserves state before its external call.
+- `nonReentrant` on `claimAggregatorCredit(address)` and `withdrawEth`. The claim is permissionless and accepts only an aggregator this adapter was configured with, so a repoint cannot strand that deployment's credit. `withdrawEth` stays `onlyOwner`. `openRound` reserves state before its external call.
 - External calls use `try/catch` with explicit status handling, never unchecked low-level calls.
 - Immutable `validationRegistry`: repointing it would silently change which registry this address is an authorized validator for. The aggregator *is* settable, and each `Job` **pins** the aggregator it was opened against, so a repoint cannot retarget a round already in flight at a different contract.
 - `openRound` refuses a `requestHash` whose registry record names a different `validatorAddress`, so ETH is not spent on a request this adapter was never asked to validate.
@@ -168,7 +168,7 @@ The reference takes the maximum element and saturates at 100. **Which element me
 - No deployment address, transaction hash, audit report, adoption figure, or endorsement is asserted. The Solidity is reference source, offered for review.
 - `ReputationSingleton`, in the same repository, exposes `EvaluationFulfilled(requestId, likelihoods, justificationCID)` and a 2× fee model, and is **not** ETH-funded. This adapter targets the aggregator; a singleton-backed variant would need a different funding path.
 - The adapter assumes `getEvaluation` returns a vector in the documented 0–100 domain. A deployment returning a different scale needs the mapping changed: saturation is not a substitute for a correct domain.
-- Gas costs, IPFS pinning and the relayer runbook are out of scope. The evaluator does not push the round surplus back: it credits `ethOwed` to the adapter, which pulls it with `claimAggregatorCredit()` before `withdrawEth(to, amount)` sweeps what the adapter then holds. Both are admin-gated and hold no user funds.
+- Gas costs, IPFS pinning and the relayer runbook are out of scope. The evaluator does not push the round surplus back: it credits `ethOwed` on the aggregator the round was opened against. `claimAggregatorCredit(aggregator)` pulls that credit in, including after a repoint; `withdrawEth(to, amount)` is the owner-only sweep. Neither custodies user funds.
 
 ## Questions the ERC-8004 community should settle
 

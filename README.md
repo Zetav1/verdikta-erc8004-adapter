@@ -33,7 +33,7 @@ Claim/withdraw sequence:
 ```
 openRound(...)               --payable, forwards maxTotalFee
    ... round settles ...
-claimAggregatorCredit()      --pulls ethOwed[adapter] out of the evaluator
+claimAggregatorCredit(agg)   --pulls ethOwed from that configured aggregator
 withdrawEth(to, amount)      --sweeps the adapter's own balance
 ```
 
@@ -76,7 +76,7 @@ Requirements:
   is intentionally left at 0 so a misconfigured adapter fails loudly rather than silently
 - `openRound` must be funded with at least `requiredRoundFunding()`. The evaluator does **not**
   push change back: it credits the surplus to `ethOwed[this adapter]`. Call
-  `claimAggregatorCredit()` (which invokes the evaluator's own `withdrawEth()`) to pull it, then
+  `claimAggregatorCredit(aggregator)` (that aggregator's `withdrawEth()`) to pull it, including after a repoint, then
   `withdrawEth(to, amount)` to sweep what the adapter holds
 
 ## Interface provenance

@@ -163,6 +163,11 @@ contract VerdiktaValidationAdapter is SimpleOwnable, ReentrancyGuardLite {
     /// @notice Verdikta aggregator whose arbiters perform the evaluation.
     IVerdiktaAggregator public verdiktaAggregator;
 
+    /// @dev Aggregators this adapter has been configured with. A claim is accepted only
+    ///      for one of these, so a repoint cannot strand `ethOwed` on the previous
+    ///      deployment and a caller cannot aim the pull at an arbitrary contract.
+    mapping(address => bool) public knownAggregators;
+
     /// @notice Relayers allowed to progress job state (open a round, record a result).
     /// @dev DESIGN PROPOSAL. ERC-8004 has no notion of relayer; it only binds
     ///      `validatorAddress` on the request. Keeping relayers separate from `owner`
@@ -224,7 +229,7 @@ contract VerdiktaValidationAdapter is SimpleOwnable, ReentrancyGuardLite {
     event ValidationTimedOut(bytes32 indexed requestHash);
     event ValidationFailed(bytes32 indexed requestHash, string reason);
     event RegistryResponseSubmitted(bytes32 indexed requestHash, uint8 response, string tag);
-    event AggregatorCreditClaimed();
+    event AggregatorCreditClaimed(address indexed aggregator);
     event EthWithdrawn(address indexed to, uint256 amount);
 
     // --- Errors ------------------------------------------------------------------
@@ -237,6 +242,7 @@ contract VerdiktaValidationAdapter is SimpleOwnable, ReentrancyGuardLite {
     error RegistryCallFailed();
     error NotSettleable();
     error NotNominatedValidator();
+    error UnknownAggregator();
     error EthTransferFailed();
 
     modifier onlyOwnerOrRelayer() {
@@ -260,7 +266,11 @@ contract VerdiktaValidationAdapter is SimpleOwnable, ReentrancyGuardLite {
         // DESIGN PROPOSAL default: 30 minutes. The aggregator's own arbiter deadline is
         // responseTimeoutSeconds (300s = 5 min default, contract-set); 30 min allows several
         // commit/reveal rounds plus manual retries before the adapter gives up.
-        timeoutSeconds = timeoutSeconds_ == 0 ? 1800 : timeoutSeconds_;
+        uint256 timeout = timeoutSeconds_ == 0 ? 1800 : timeoutSeconds_;
+        // Same floor as setPolicy. A 1–59s window is as much a footgun as zero:
+        // resolveFailure could fire before the aggregator's own round can finish.
+        timeoutSeconds = timeout < 60 ? 60 : timeout;
+        knownAggregators[verdiktaAggregator_] = true;
         // DESIGN PROPOSAL: the aggregator holds no alpha, no fee default and no base-cost
         // constant. It takes all of them per request. 500 is the balanced reputation weight
         // used by Verdikta's own DemoClient, not a contract default; 5 mirrors the typical
@@ -286,6 +296,9 @@ contract VerdiktaValidationAdapter is SimpleOwnable, ReentrancyGuardLite {
     function setAggregator(address aggregator_) external onlyOwner {
         if (aggregator_ == address(0)) revert ZeroAddress();
         verdiktaAggregator = IVerdiktaAggregator(aggregator_);
+        // Keep the previous aggregator claimable. Its ethOwed credit does not move
+        // when this pointer changes.
+        knownAggregators[aggregator_] = true;
         emit AggregatorUpdated(aggregator_);
     }
 
@@ -306,26 +319,28 @@ contract VerdiktaValidationAdapter is SimpleOwnable, ReentrancyGuardLite {
         // Enforce a floor rather than silently documenting a footgun.
         timeoutSeconds = timeoutSeconds_ < 60 ? 60 : timeoutSeconds_;
         emit PolicyUpdated(
-            alpha_, maxOracleFee_, estimatedBaseCost_, maxFeeBasedScalingFactor_, requestedClass_, timeoutSeconds_
+            alpha_, maxOracleFee_, estimatedBaseCost_, maxFeeBasedScalingFactor_, requestedClass_, timeoutSeconds
         );
     }
 
-    /// @notice Pull the round surplus this adapter is credited with inside the aggregator.
+    /// @notice Pull this adapter's `ethOwed` credit out of a configured aggregator.
     /// @dev The aggregator credits refunds to `ethOwed[requester]` and does NOT push ETH.
     ///      `_refundRequester` only does `ethOwed[agg.requester] += refund`. This adapter is
-    ///      that requester, so the surplus is stranded until this call is made. The
-    ///      aggregator then transfers to `msg.sender` == this adapter, which `receive()` accepts.
-    ///      Permissionless on purpose: it can only ever move the credit TO this contract.
-    ///      Note: the aggregator reverts with `NothingOwed()` when the credit is zero, so this
-    ///      call reverts too in that case. That is the intended signal -- simulate with
-    ///      `ethOwed(address(this))` on the aggregator rather than treating the revert as an error.
-    function claimAggregatorCredit() external nonReentrant {
-        verdiktaAggregator.withdrawEth();
-        emit AggregatorCreditClaimed();
+    ///      that requester. Pass the aggregator the round was opened against: after
+    ///      `setAggregator`, the surplus stays on the previous deployment.
+    ///      The aggregator then transfers to `msg.sender` == this adapter, which `receive()` accepts.
+    ///      Permissionless on purpose: it can only move credit TO this contract, and only
+    ///      from an aggregator this adapter was configured with.
+    ///      The aggregator reverts with `NothingOwed()` when the credit is zero, so this
+    ///      call reverts too. Simulate with `ethOwed(address(this))` on that aggregator.
+    function claimAggregatorCredit(address aggregator_) external nonReentrant {
+        if (aggregator_ == address(0) || !knownAggregators[aggregator_]) revert UnknownAggregator();
+        IVerdiktaAggregator(aggregator_).withdrawEth();
+        emit AggregatorCreditClaimed(aggregator_);
     }
 
     /// @notice Sweep ETH actually held by this adapter to a destination.
-    /// @dev Run `claimAggregatorCredit()` first, otherwise this only moves a balance that
+    /// @dev Run `claimAggregatorCredit(aggregator)` first, otherwise this only moves a balance that
     ///      may still be zero while the surplus sits in the aggregator's ledger.
     ///      nonReentrant; no state is written after the call.
     function withdrawEth(address payable to, uint256 amount) external onlyOwner nonReentrant {
@@ -344,7 +359,7 @@ contract VerdiktaValidationAdapter is SimpleOwnable, ReentrancyGuardLite {
      * @dev Caller must forward ETH of at least `aggregator.maxTotalFee(maxOracleFee)`.
      *      The aggregator does NOT push change back: it credits the surplus to
      *      `ethOwed[this adapter]`. That credit must be pulled with
-     *      claimAggregatorCredit(), which calls the aggregator's own withdrawEth().
+     *      claimAggregatorCredit(aggregator), which calls that aggregator's withdrawEth().
      *
      *      Why a relayer call and not an automatic hook: ERC-8004 emits ValidationRequest
      *      as an event; there is no on-chain callback to `validatorAddress`. Something
@@ -389,14 +404,13 @@ contract VerdiktaValidationAdapter is SimpleOwnable, ReentrancyGuardLite {
         ) returns (bytes32 aggId) {
             aggRequestId = aggId;
         } catch {
-            job.status = Status.None; // release the reservation
-            emit ValidationFailed(requestHash, "aggregator_revert");
+            // The revert unwinds this assignment and any event. Nothing is observable.
+            job.status = Status.None;
             revert AggregatorCallFailed();
         }
 
         if (aggRequestId == bytes32(0)) {
             job.status = Status.None;
-            emit ValidationFailed(requestHash, "aggregator_zero_id");
             revert AggregatorCallFailed();
         }
 
@@ -424,12 +438,9 @@ contract VerdiktaValidationAdapter is SimpleOwnable, ReentrancyGuardLite {
             agg.getEvaluation(job.aggRequestId);
 
         if (!exists) {
-            // Not usable yet. Tell the relayer whether to wait or to give up, then revert
-            // so no placeholder score is ever latched.
-            (bool isComplete, bool failed,,,,,,,,) = agg.getAggregationStatus(job.aggRequestId);
-            if (isComplete && failed) {
-                emit ValidationFailed(requestHash, "aggregator_failed");
-            }
+            // Still running, or finished in failure. Either way no score is latched.
+            // An event here would be wiped by the revert. resolveFailure(_, false)
+            // is the path that records a failed round.
             revert NotSettleable();
         }
 
