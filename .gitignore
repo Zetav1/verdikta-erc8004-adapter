@@ -1,0 +1,11 @@
+# build artifacts
+*.bin
+*.abi
+out/
+cache/
+solc.exe
+
+# local
+.DS_Store
+Thumbs.db
+*.swp
