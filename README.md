@@ -28,6 +28,15 @@ evaluation dispatch can serve as the `validatorAddress` of an
 | `forum-post.md` | Ethereum Magicians post text |
 | `build.sh` | Fetches solc and compiles the adapter |
 
+Claim/withdraw sequence:
+
+```
+openRound(...)               --payable, forwards maxTotalFee
+   ... round settles ...
+claimAggregatorCredit()      --pulls ethOwed[adapter] out of the evaluator
+withdrawEth(to, amount)      --sweeps the adapter's own balance
+```
+
 ## Lifecycle
 
 ```
@@ -65,8 +74,10 @@ Requirements:
 - Constructor: `owner`, `validationRegistry`, `verdiktaAggregator`, `requestedClass`, `timeoutSeconds`
 - Owner must call `setPolicy` (alpha, fee ceiling, class, timeout) before use; `maxOracleFee`
   is intentionally left at 0 so a misconfigured adapter fails loudly rather than silently
-- `openRound` must be funded with at least `requiredRoundFunding()`; the evaluator refunds
-  the unused remainder to the adapter, recoverable via `withdrawEth`
+- `openRound` must be funded with at least `requiredRoundFunding()`. The evaluator does **not**
+  push change back: it credits the surplus to `ethOwed[this adapter]`. Call
+  `claimAggregatorCredit()` (which invokes the evaluator's own `withdrawEth()`) to pull it, then
+  `withdrawEth(to, amount)` to sweep what the adapter holds
 
 ## Interface provenance
 

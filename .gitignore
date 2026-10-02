@@ -9,3 +9,11 @@ solc.exe
 .DS_Store
 Thumbs.db
 *.swp
+
+# local submission scaffolding -- never published
+depure/
+CHECKLIST.md
+posting-record.md
+forum-post.md
+repo.png
+forum-post.png

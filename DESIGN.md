@@ -49,6 +49,8 @@ writeup, not a solved problem.
 ## Trust assumptions (summary)
 
 - The requesting agent owner trusts the adapter address they nominate as `validatorAddress`.
+- Round surplus is a pull: the evaluator credits `ethOwed[adapter]`; it is not transferred until
+  `claimAggregatorCredit()` runs.
 - The adapter trusts its configured evaluator deployment and oracle class. ERC-8004 leaves
   incentives and slashing to the validation protocol, so this trust sits in Verdikta's
   economics and reputation system, not in the registry.

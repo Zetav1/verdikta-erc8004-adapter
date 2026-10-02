@@ -100,6 +100,12 @@ interface IVerdiktaAggregator {
 
     /// @dev Worst-case cost of a round: effMaxFee * (K + B*P).
     function maxTotalFee(uint256 requestedMaxOracleFee) external view returns (uint256);
+
+    /// @dev Pull-payment claim for the caller's own credited balance (ethOwed[msg.sender]).
+    ///      Refunds are NOT pushed by the aggregator: _refundRequester only does
+    ///      `ethOwed[requester] += refund`. Without this call the round surplus stays
+    ///      credited to this adapter inside the aggregator and is unreachable.
+    function withdrawEth() external;
 }
 
 /// @dev Ownable-style access control, inlined to keep this file dependency-free.
@@ -188,6 +194,7 @@ contract VerdiktaValidationAdapter is SimpleOwnable, ReentrancyGuardLite {
         uint256 agentId;
         bytes32 requestHash;
         bytes32 aggRequestId; // Verdikta aggregator id
+        address aggregator; // the aggregator this round was opened against (pinned)
         uint64 openedAt; // block.timestamp when the round was opened
         uint8 mappedResponse; // 0-100, ERC-8004 response domain
         string responseURI; // IPFS CID of the justification
@@ -217,6 +224,7 @@ contract VerdiktaValidationAdapter is SimpleOwnable, ReentrancyGuardLite {
     event ValidationTimedOut(bytes32 indexed requestHash);
     event ValidationFailed(bytes32 indexed requestHash, string reason);
     event RegistryResponseSubmitted(bytes32 indexed requestHash, uint8 response, string tag);
+    event AggregatorCreditClaimed();
     event EthWithdrawn(address indexed to, uint256 amount);
 
     // --- Errors ------------------------------------------------------------------
@@ -228,6 +236,7 @@ contract VerdiktaValidationAdapter is SimpleOwnable, ReentrancyGuardLite {
     error AggregatorCallFailed();
     error RegistryCallFailed();
     error NotSettleable();
+    error NotNominatedValidator();
     error EthTransferFailed();
 
     modifier onlyOwnerOrRelayer() {
@@ -252,7 +261,11 @@ contract VerdiktaValidationAdapter is SimpleOwnable, ReentrancyGuardLite {
         // responseTimeoutSeconds (300s = 5 min default, contract-set); 30 min allows several
         // commit/reveal rounds plus manual retries before the adapter gives up.
         timeoutSeconds = timeoutSeconds_ == 0 ? 1800 : timeoutSeconds_;
-        alpha = 500; // matches the aggregator's own default alpha
+        // DESIGN PROPOSAL: the aggregator holds no alpha, no fee default and no base-cost
+        // constant. It takes all of them per request. 500 is the balanced reputation weight
+        // used by Verdikta's own DemoClient, not a contract default; 5 mirrors the typical
+        // scaling factor in the same example; 8e9 is this adapter's own estimate.
+        alpha = 500;
         maxFeeBasedScalingFactor = 5;
         estimatedBaseCost = 8e9;
         // maxOracleFee intentionally left 0 until the owner sets policy: a 0 ceiling would
@@ -268,7 +281,8 @@ contract VerdiktaValidationAdapter is SimpleOwnable, ReentrancyGuardLite {
     }
 
     /// @dev Not immutable on purpose: a Verdikta aggregator deployment can be superseded.
-    ///      Repointing only affects future rounds; open rounds keep their stored aggRequestId.
+    ///      Each Job pins the aggregator it was opened against, so repointing does not
+    ///      retarget already-open rounds at a different contract.
     function setAggregator(address aggregator_) external onlyOwner {
         if (aggregator_ == address(0)) revert ZeroAddress();
         verdiktaAggregator = IVerdiktaAggregator(aggregator_);
@@ -288,14 +302,32 @@ contract VerdiktaValidationAdapter is SimpleOwnable, ReentrancyGuardLite {
         estimatedBaseCost = estimatedBaseCost_;
         maxFeeBasedScalingFactor = maxFeeBasedScalingFactor_;
         requestedClass = requestedClass_;
-        timeoutSeconds = timeoutSeconds_;
+        // A zero window would let resolveFailure fire in the same timestamp the round opened.
+        // Enforce a floor rather than silently documenting a footgun.
+        timeoutSeconds = timeoutSeconds_ < 60 ? 60 : timeoutSeconds_;
         emit PolicyUpdated(
             alpha_, maxOracleFee_, estimatedBaseCost_, maxFeeBasedScalingFactor_, requestedClass_, timeoutSeconds_
         );
     }
 
-    /// @notice Recover ETH not consumed by a round (aggregator refunds land here).
-    /// @dev nonReentrant; no state is written after the call (Checks-Effects-Interactions).
+    /// @notice Pull the round surplus this adapter is credited with inside the aggregator.
+    /// @dev The aggregator credits refunds to `ethOwed[requester]` and does NOT push ETH.
+    ///      `_refundRequester` only does `ethOwed[agg.requester] += refund`. This adapter is
+    ///      that requester, so the surplus is stranded until this call is made. The
+    ///      aggregator then transfers to `msg.sender` == this adapter, which `receive()` accepts.
+    ///      Permissionless on purpose: it can only ever move the credit TO this contract.
+    ///      Note: the aggregator reverts with `NothingOwed()` when the credit is zero, so this
+    ///      call reverts too in that case. That is the intended signal -- simulate with
+    ///      `ethOwed(address(this))` on the aggregator rather than treating the revert as an error.
+    function claimAggregatorCredit() external nonReentrant {
+        verdiktaAggregator.withdrawEth();
+        emit AggregatorCreditClaimed();
+    }
+
+    /// @notice Sweep ETH actually held by this adapter to a destination.
+    /// @dev Run `claimAggregatorCredit()` first, otherwise this only moves a balance that
+    ///      may still be zero while the surplus sits in the aggregator's ledger.
+    ///      nonReentrant; no state is written after the call.
     function withdrawEth(address payable to, uint256 amount) external onlyOwner nonReentrant {
         if (to == address(0)) revert ZeroAddress();
         (bool ok,) = to.call{value: amount}("");
@@ -310,8 +342,9 @@ contract VerdiktaValidationAdapter is SimpleOwnable, ReentrancyGuardLite {
     /**
      * @notice Open a Verdikta evaluation for an ERC-8004 validation request.
      * @dev Caller must forward ETH of at least `aggregator.maxTotalFee(maxOracleFee)`.
-     *      The aggregator credits the unused remainder to THIS contract's refund balance,
-     *      recoverable via withdrawEth().
+     *      The aggregator does NOT push change back: it credits the surplus to
+     *      `ethOwed[this adapter]`. That credit must be pulled with
+     *      claimAggregatorCredit(), which calls the aggregator's own withdrawEth().
      *
      *      Why a relayer call and not an automatic hook: ERC-8004 emits ValidationRequest
      *      as an event; there is no on-chain callback to `validatorAddress`. Something
@@ -332,6 +365,17 @@ contract VerdiktaValidationAdapter is SimpleOwnable, ReentrancyGuardLite {
         if (cids.length == 0) revert EmptyCids();
         Job storage job = jobs[requestHash];
         if (job.status != Status.None) revert BadStatus();
+        // DESIGN PROPOSAL guard: refuse to spend ETH on a request that was not addressed to
+        // this adapter. ERC-8004 stores `validatorAddress` on the request, so if the registry
+        // already has a status for this hash and it names someone else, the round would be
+        // paid for and then rejected by validationResponse. If the registry has no record yet
+        // (request not submitted, or implementation reverts on unknown hash), this check is
+        // skipped and the relayer remains responsible -- see the trust section of the writeup.
+        try validationRegistry.getValidationStatus(requestHash) returns (
+            address validator, uint256, uint8, bytes32, string memory, uint256
+        ) {
+            if (validator != address(0) && validator != address(this)) revert NotNominatedValidator();
+        } catch {}
 
         // Effects before interaction: reserve the slot so a re-entrant or retried call
         // cannot open two rounds for the same requestHash.
@@ -357,6 +401,7 @@ contract VerdiktaValidationAdapter is SimpleOwnable, ReentrancyGuardLite {
         }
 
         job.aggRequestId = aggRequestId;
+        job.aggregator = address(verdiktaAggregator);
         aggToRequestHash[aggRequestId] = requestHash;
         emit RoundOpened(requestHash, agentId, aggRequestId);
     }
@@ -374,13 +419,14 @@ contract VerdiktaValidationAdapter is SimpleOwnable, ReentrancyGuardLite {
         Job storage job = jobs[requestHash];
         if (job.status != Status.Requested) revert BadStatus();
 
+        IVerdiktaAggregator agg = IVerdiktaAggregator(job.aggregator);
         (uint256[] memory likelihoods, string memory justificationCID, bool exists) =
-            verdiktaAggregator.getEvaluation(job.aggRequestId);
+            agg.getEvaluation(job.aggRequestId);
 
         if (!exists) {
             // Not usable yet. Tell the relayer whether to wait or to give up, then revert
             // so no placeholder score is ever latched.
-            (bool isComplete, bool failed,,,,,,,,) = verdiktaAggregator.getAggregationStatus(job.aggRequestId);
+            (bool isComplete, bool failed,,,,,,,,) = agg.getAggregationStatus(job.aggRequestId);
             if (isComplete && failed) {
                 emit ValidationFailed(requestHash, "aggregator_failed");
             }
@@ -413,9 +459,15 @@ contract VerdiktaValidationAdapter is SimpleOwnable, ReentrancyGuardLite {
 
         if (timeout_) {
             if (block.timestamp < uint256(job.openedAt) + timeoutSeconds) revert TimeoutNotReached();
+            // A policy deadline is not evidence of absence. If the round already produced a
+            // usable result that nobody settled yet, writing 0 here would overwrite a real
+            // score with a false negative. Refuse and let settle() latch it.
+            (, , bool exists) = IVerdiktaAggregator(job.aggregator).getEvaluation(job.aggRequestId);
+            if (exists) revert NotSettleable();
             job.tag = "timeout";
         } else {
-            (bool isComplete, bool failed,,,,,,,,) = verdiktaAggregator.getAggregationStatus(job.aggRequestId);
+            IVerdiktaAggregator agg = IVerdiktaAggregator(job.aggregator);
+            (bool isComplete, bool failed,,,,,,,,) = agg.getAggregationStatus(job.aggRequestId);
             if (!(isComplete && failed)) revert BadStatus();
             job.tag = "failed";
         }
@@ -457,9 +509,14 @@ contract VerdiktaValidationAdapter is SimpleOwnable, ReentrancyGuardLite {
         ) {
             emit RegistryResponseSubmitted(requestHash, job.mappedResponse, job.tag);
         } catch {
-            // Restore the prior status, which is the status the corresponding entrypoint
-            // accepts, so the retry path always exists: TimedOut/Failed are re-derived by
-            // resolveFailure, Fulfilled by submitValidationResponse. No job can get stuck.
+            // The revert below rolls back the ENTIRE transaction, including the
+            // `job.status = Status.Responded` above and this assignment. There is no partial
+            // commit: the job simply returns to whatever status it had on entry (Requested or
+            // Fulfilled), which is exactly the status the corresponding entrypoint accepts, so
+            // the call can be retried. The assignment is kept for clarity but is not what makes
+            // the retry work. TimedOut/Failed are internal marks within a single transaction --
+            // they are never observable externally, because resolveFailure writes them and
+            // reaches Responded in the same call, or reverts entirely.
             job.status = prior;
             revert RegistryCallFailed();
         }
